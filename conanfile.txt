@@ -1,0 +1,6 @@
+[requires]
+    cfitsio/3.470
+    eigen/3.4.0
+    
+[generators]
+    pkg_config

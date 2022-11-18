@@ -1,0 +1,12 @@
+.DS_Store
+.idea
+cmake-build-*
+build
+.vscode
+.ccls-cache
+python/playground.ipynb
+*.o
+__pycache__
+main.ipynb
+*.fits
+experiments
