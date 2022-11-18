@@ -1,7 +1,7 @@
 # DARE Solver
 
 # 1. Introduction
-High Performance Discrete time Algebraic Riccati Equation [(DARE)](https://en.wikipedia.org/wiki/Algebraic_Riccati_equation) Solver Library. The DARE solver is used in Adaptive Optics system of extreme large ground-based Telescope such as MAVIS. It has significant better application peformance than other traditional methods. However the computation cost is also much higher. According to our benchmark of MAVIS system, the application has best accuracy when the matrices dimension is more than 20k x 20k. Our High Performance DARE solver exploit advanced linear algebra runtime system such as [Chameleon](https://solverstack.gitlabpages.inria.fr/chameleon/) or [DPLASMA](https://github.com/icldisco/dplasma) to deploy the algorithm onto multiple GPUs/CPUs at a shared memory system.
+This library provides a high-performance implementation of the Discrete time Algebraic Riccati Equation [(DARE)](https://en.wikipedia.org/wiki/Algebraic_Riccati_equation) solver. The DARE solver is used in Adaptive Optics (AO) system of extremely large ground-based telescopes with instruments such as MAVIS. It has significant better application's peformance than other traditional methods. However, the computational cost is also much higher. According to our benchmark on MAVIS specifications, the application has best accuracy when the matrix dimension is more than 20k x 20k. Our high-performance DARE solver exploits advanced linear algebra libraries associated with runtime system, such as [Chameleon](https://solverstack.gitlabpages.inria.fr/chameleon/) or [DPLASMA](https://github.com/icldisco/dplasma), to deploy the DARE algorithm onto shared-memory multicore systems equipped with multiple GPU hardware accelerators.
 
 # 2. Dependencies
   * CMake (>=3.19)
@@ -69,4 +69,4 @@ For more information and questions please send email to yuxi.hong@kaust.edu.sa a
 
 Handout
 ========
-![alt text](https://github.com/ecrc/dare/blob/main/misc/dare-handout-final.pdf)
+![image](https://github.com/ecrc/dare/blob/master/misc/dare-handout-draft2.png)
