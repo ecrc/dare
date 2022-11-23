@@ -9,7 +9,7 @@ pipeline {
         timestamps()
     }
     stages {
-        stage ('build-dare') {
+        stage ('build-dare-chameleon') {
             steps {
             sh '''#!/bin/bash -el
                     module purge
@@ -23,7 +23,7 @@ pipeline {
                     module list
                     daredir=$(pwd)
                    # starpu
-                    cd $HOME && rm -rf starpu-1.3.9.tar.gz starpu-1.3.9
+                    cd $HOME && rm -rf starpu-1.3.9.tar.gz starpu-1.3.9 7090
                     wget https://files.inria.fr/starpu/starpu-1.3.9/starpu-1.3.9.tar.gz
                     tar -xzf starpu-1.3.9.tar.gz
                     cd starpu-1.3.9
@@ -36,7 +36,6 @@ pipeline {
                     make install -j
                     export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$STARPU_ROOT/build/install/lib/pkgconfig
                     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$STARPU_ROOT/build/install/lib
-
                     # chameleon
                     cd $HOME && rm -rf chameleon-1.1.0.tar.gz chameleon-1.1.0
                     wget https://gitlab.inria.fr/solverstack/chameleon/uploads/b299d6037d7636c6be16108c89bc2aab/chameleon-1.1.0.tar.gz
@@ -50,14 +49,13 @@ pipeline {
                     export CHAMELEON_TESTING=$CHAMELEON_ROOT/testing
                     export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$CHAMELEON_ROOT/build/install/lib/pkgconfig
                     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CHAMELEON_ROOT/build/install/lib
-
                     rm -rf ~/.venv/dareenv
                     python -m venv ~/.venv/dareenv
                     source ~/.venv/dareenv/bin/activate
                     pip install conan
                     # dare installation
                     cd $daredir
-                    rm -rf build && mkdir build && cd build
+                    rm -rf build-chameleon && mkdir build-chameleon && cd build-chameleon
                     conan install -b missing ..
                     export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$(pwd)
                     cmake -DCMAKE_CUDA_COMPILER=$(which nvcc) -DCHAMELEON_BACKEND=ON -DDPLASMA_BACKEND=OFF ..
@@ -65,9 +63,9 @@ pipeline {
                     '''
             }
         }
-        stage ('dare-test') {
+        stage ('dare-test-chameleon') {
             steps {
-            sh '''#!/bin/bash -el
+            sh '''#!/bin/bash -el                    
                     module purge
                     module load gcc/10.2.0
                     module load cmake/3.19.2
@@ -88,8 +86,7 @@ pipeline {
                     export CHAMELEON_TESTING=$CHAMELEON_ROOT/testing
                     export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$CHAMELEON_ROOT/build/install/lib/pkgconfig
                     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CHAMELEON_ROOT/build/install/lib
-
-                    cd build
+                    cd build-chameleon
                     CHAMELEON_USE_CUDA=1 STARPU_SILENT=1 OMP_NUM_THREADS=1 \
                     MKL_NUM_THREADS=1 STARPU_CUDA_PIPELINE=4 STARPU_NWORKER_PER_CUDA=4 \
                     STARPU_SCHED=dmda STARPU_CALIBRATE=1 CUDA_VISIBLE_DEVICES=0 \
@@ -97,5 +94,69 @@ pipeline {
                     '''
             }
         }
+                stage ('build-dare-dplasma') {
+            steps {
+            sh '''#!/bin/bash -el
+                    module purge
+                    module load gcc/10.2.0
+                    module load cmake/3.19.2
+                    module load cuda/11.4
+                    module load openmpi/4.1.0-gcc-10.2.0
+                    module load hwloc/2.4.0-gcc-10.2.0
+                    module load python-3.9.9-gcc-7.5.0-bp37qr2
+                    module load mkl/2020.0.166
+                    module list
+                    daredir=$(pwd)
+                   # starpu
+                    cd $HOME
+                    rm -rf dplasma
+                    git clone --recursive https://github.com/ICLDisco/dplasma.git
+                    cd dplasma
+                    mkdir build && cd build
+                    ../configure --prefix=$(pwd)/install \
+                    --with-cuda=$CUDA_HOME -DCMAKE_CUDA_COMPILER=$(which nvcc)
+                    make install -j
+                    export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$HOME/dplasma/build/install/lib/pkgconfig
+                    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/dplasma/build/install/lib
+                    rm -rf ~/.venv/dareenv
+                    python -m venv ~/.venv/dareenv
+                    source ~/.venv/dareenv/bin/activate
+                    pip install conan
+                    # dare installation
+                    cd $daredir
+                    rm -rf build-dplasma && mkdir build-dplasma && cd build-dplasma
+                    conan install -b missing ..
+                    export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$(pwd)
+                    cmake -DCMAKE_CUDA_COMPILER=$(which nvcc) -DCHAMELEON_BACKEND=OFF -DDPLASMA_BACKEND=ON ..
+                    make -j
+                    '''
+            }
+        }
+        stage ('dare-test-dplasma') {
+            steps {
+            sh '''#!/bin/bash -el
+                    module purge
+                    module load gcc/10.2.0
+                    module load cmake/3.19.2
+                    module load cuda/11.4
+                    module load openmpi/4.1.0-gcc-10.2.0
+                    module load hwloc/2.4.0-gcc-10.2.0
+                    module load python-3.9.9-gcc-7.5.0-bp37qr2
+                    module load mkl/2020.0.166
+                    module list
+                    echo $(pwd)
+                    ls
+                    echo "look into home"
+                    ls $HOME
+                    cd build-dplasma
+                    export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$HOME/dplasma/build/install/lib/pkgconfig
+                    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/dplasma/build/install/lib
+                    export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$(pwd)
+                    ./ddareparsec -c 20 -g 1 > log.txt
+                    '''
+            }
+        }
+
     }
 }
+

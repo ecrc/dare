@@ -1,3 +1,6 @@
+// @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+//                     All rights reserved.
+
 extern "C" %{
 /*
  * Copyright (c) 2011-2021 The University of Tennessee and The University

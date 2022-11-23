@@ -1,3 +1,6 @@
+#  @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+#                      All rights reserved.
+
 import numpy as np
 from astropy.io.fits import open as fitsopen
 from astropy.io.fits import writeto as fitswrite

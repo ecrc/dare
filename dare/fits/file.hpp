@@ -1,3 +1,6 @@
+// @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+//                     All rights reserved.
+
 #ifndef IO_FITS_FILE_H
 #define IO_FITS_FILE_H
 #include <string>

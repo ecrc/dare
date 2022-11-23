@@ -1,3 +1,6 @@
+// @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+//                     All rights reserved.
+
 /**
  * This file is used to test chameleon correctness on multiple gpus.
  * The only dependencies is chameleon.

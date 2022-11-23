@@ -1,19 +1,5 @@
-/**
- *
- * @file testings.h
- *
- * @copyright 2019-2021 Bordeaux INP, CNRS (LaBRI UMR 5800), Inria,
- *                      Univ. Bordeaux. All rights reserved.
- ***
- *
- * @brief Chameleon auxiliary routines for testing structures
- *
- * @version 1.1.0
- * @author Lucas Barros de Assis
- * @author Mathieu Faverge
- * @date 2020-03-11
- *
- */
+// @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+//                     All rights reserved.
 #ifndef _testings_h_
 #define _testings_h_
 

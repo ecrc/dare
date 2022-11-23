@@ -1,3 +1,6 @@
+#  @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+#                      All rights reserved.
+
 from asyncore import write
 import numpy as np
 from os.path import join

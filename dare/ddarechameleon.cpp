@@ -1,3 +1,6 @@
+// @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+//                     All rights reserved.
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
