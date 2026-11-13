@@ -1,0 +1,182 @@
+--- a/dare/ddarechameleon.cpp
++++ b/dare/ddarechameleon.cpp
+@@ -1,6 +1,9 @@
+ // @Copyright (c) 2022 King Abdullah University of Science and Technology (KAUST).
+ //                     All rights reserved.
+ 
++#include <chrono>
++#include <cmath>
++#include <utility>
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -20,6 +23,22 @@
+ 
+ using std::to_string;
+ 
++// Experimental switches are opt-in; profiling inserts barriers and is not a benchmark.
++static bool dare_enabled(const char *name) {
++    const char *value = getenv(name);
++    return value && strcmp(value, "1") == 0;
++}
++
++static int dare_copy(CHAM_desc_t *src, CHAM_desc_t *dst,
++                     RUNTIME_sequence_t *sequence, RUNTIME_request_t *request) {
++    if (dare_enabled("DARE_GPU_COPY")) {
++        // dgeadd has a CUDA implementation; beta=0 declares write-only destination.
++        return CHAMELEON_dgeadd_Tile_Async(ChamNoTrans, 1.0, src, 0.0, dst, sequence, request);
++    }
++    return CHAMELEON_dlacpy_Tile_Async(ChamUpperLower, src, dst, sequence, request);
++}
++
++
+ static void get_thread_count(int *thrdnbr) {
+     *thrdnbr = sysconf(_SC_NPROCESSORS_ONLN);
+ }
+@@ -411,7 +430,23 @@
+ 
+ 
+     /* Calculates the DARE solution */
++    const bool swap_alpha = dare_enabled("DARE_SWAP_ALPHA");
++    const bool phase_profile = dare_enabled("DARE_PHASE_PROFILE");
++    const bool stage_barriers = dare_enabled("DARE_STAGE_BARRIERS");
++    auto phase_start = std::chrono::steady_clock::now();
++    auto phase = [&](const char *name, int iteration) {
++        if (!phase_profile && !stage_barriers) return;
++        CHAMELEON_Sequence_Wait(sequence);
++        if (!phase_profile) return;
++        const auto now = std::chrono::steady_clock::now();
++        const double seconds = std::chrono::duration<double>(now - phase_start).count();
++        printf("PHASE %d %s %.9f\n", iteration, name, seconds);
++        phase_start = now;
++    };
++    printf("GPU_COPY %d PHASE_PROFILE %d STAGE_BARRIERS %d SWAP_ALPHA %d\n",
++           dare_enabled("DARE_GPU_COPY"), phase_profile, stage_barriers, swap_alpha);
+     START_TIMING( time );
++    phase_start = std::chrono::steady_clock::now();
+     printf("\n");
+     CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamTrans,
+                       1.0, descB, descB,
+@@ -420,13 +455,15 @@
+ 		      sequence, &request );
+     if (sync) CHAMELEON_Sequence_Wait( sequence );
+     flops = flops + flops_dgemm( N, N, NINSTR );
+-    CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descA, descalpha, sequence, &request );
++    dare_copy(descA, descalpha, sequence, &request);
+     if (sync) CHAMELEON_Sequence_Wait( sequence );
+-    CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descQ, descgamma, sequence, &request );
++    dare_copy(descQ, descgamma, sequence, &request);
+     if (sync) CHAMELEON_Sequence_Wait( sequence );
+     CHAMELEON_dlaset_Tile_Async( ChamUpperLower, 0.0, 1.0, descId, sequence, &request );
+     if (sync) CHAMELEON_Sequence_Wait( sequence );
+ 
++    phase("initialization", 0);
++
+     /* Create the task flag */
+     //RUNTIME_option_t options;
+ 
+@@ -438,7 +475,7 @@
+         //RUNTIME_barrier( chamctxt );
+         //RUNTIME_options_init_color(&options, chamctxt);
+ 
+-        CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descbetaold, descbeta, sequence, &request );
++        dare_copy(descbetaold, descbeta, sequence, &request);
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamNoTrans,
+                           1.0, descbeta, descgamma,
+@@ -447,9 +484,10 @@
+         flops = flops + flops_dgemm( N, N, N );
+         CHAMELEON_dgeadd_Tile_Async( ChamNoTrans, 1.0, descId, 1.0, desccommon, sequence, &request );
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+-        CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descalpha, descalphaold, sequence, &request );
++        dare_copy(descalpha, descalphaold, sequence, &request);
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+ 
++        phase("form_system", it);
+         //RUNTIME_options_init_color(&options, chamctxt);
+         /*
+         if (nooptalgo) {
+@@ -474,6 +512,7 @@
+                  if (sync) CHAMELEON_Sequence_Wait( sequence );
+                  flops = flops + flops_dgetrf( N, N ) + flops_dgetrs( N, N );
+ 
++        phase("solve_alpha", it);
+         //RUNTIME_options_init_color(&options, chamctxt);
+         CHAMELEON_dgemm_Tile_Async( ChamTrans, ChamNoTrans,
+                           1.0, descalphaold, descgamma,
+@@ -487,13 +526,14 @@
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+         flops = flops + flops_dgemm( N, N, N );
+ 
++        phase("update_gamma", it);
+ 	if (check) {
+             //err = norm(gamma-(A'*gamma*A - (A'*gamma*B)*inv(R+B'*gamma*B)*(B'*gamma*A) + Q))
+             CHAMELEON_dgemm_Tile_Async( ChamTrans, ChamNoTrans,
+                    1.0, descBinit, descgamma,
+                    0.0, descbuf2, ws8, sequence, &request );
+             if (sync) CHAMELEON_Sequence_Wait( sequence );
+-            CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descR, descbuf4, sequence, &request );
++            dare_copy(descR, descbuf4, sequence, &request);
+             if (sync) CHAMELEON_Sequence_Wait( sequence );
+ 	    //norm = CHAMELEON_dlange_Tile( ChamFrobeniusNorm, descbuf2 );
+             //if (sync) CHAMELEON_Sequence_Wait( sequence );
+@@ -559,6 +599,12 @@
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+         //CHAMELEON_Desc_Flush( descbuf1, sequence );
+ 
++        phase("convergence_norm", it);
++        if (!std::isfinite(norm) || norm < 0.0) {
++            fprintf(stderr, "DARE convergence norm failed: %e\n", norm);
++            sequence->status = CHAMELEON_ERR_UNEXPECTED;
++            break;
++        }
+ 	printf("it %d norm %e tol %e\n", it, norm, tol);
+ 	if (norm < tol) {
+ 	   break;
+@@ -602,6 +648,7 @@
+                  if (sync) CHAMELEON_Sequence_Wait( sequence );
+                  flops = flops + flops_dgetrs( N, N );
+ 
++        phase("solve_beta", it);
+         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamTrans,
+                           1.0, descbeta, descalphaold,
+                           0.0, descbuf1, ws5, sequence, &request );
+@@ -621,9 +668,16 @@
+         if (sync) CHAMELEON_Sequence_Wait( sequence );
+         flops = flops + flops_dgemm( N, N, N );
+ 
+-        CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descbuf1, descalpha, sequence, &request );
+-        if (sync) CHAMELEON_Sequence_Wait( sequence );
++        if (swap_alpha) {
++            // The descriptors have identical geometry. Submitted tasks retain
++            // their tile handles while the next iteration uses the new roles.
++            std::swap(descbuf1, descalpha);
++        } else {
++            dare_copy(descbuf1, descalpha, sequence, &request);
++            if (sync) CHAMELEON_Sequence_Wait( sequence );
++        }
+ 
++        phase("update_beta_alpha", it);
+         //write_desc<double>(std::string("descalpha.fits"),descalpha);
+ 
+ #if 0
+@@ -668,12 +722,19 @@
+     CHAMELEON_Sequence_Wait( sequence );
+     flops = flops + flops_dgemm( NINSTR, N, N );
+ 
++    phase("gain", it);
+     STOP_TIMING( time );
+     const int hres = sequence->status;
+     if (hres != CHAMELEON_SUCCESS) {
+         fprintf(stderr, "Chameleon sequence failed with status %d\n", hres);
+     }
+ 
++    if (hres == CHAMELEON_SUCCESS) {
++        if (const char *prefix = getenv("DARE_OUTPUT_PREFIX")) {
++            write_desc<double>(std::string(prefix) + "-K.fits", descK);
++            write_desc<double>(std::string(prefix) + "-P.fits", descgamma);
++        }
++    }
+ //    write_desc<double>(std::string(datapath + "/descK"+to_string(N)+"-double-lunopiv.fits"),descK);
+ 
+     /* Stop tracing */

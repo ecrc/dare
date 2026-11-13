@@ -1,0 +1,36 @@
+--- a/control/common.h
++++ b/control/common.h
+@@ -40,7 +40,6 @@
+ #include <cuda_runtime.h>
+ #include <cuda_runtime_api.h>
+ #if defined(CHAMELEON_USE_CUBLAS_V2)
+-#include <cublas.h>
+ #include <cublas_v2.h>
+ #else
+ #include <cublas.h>
+--- a/cudablas/include/cudablas.h
++++ b/cudablas/include/cudablas.h
+@@ -38,7 +38,6 @@
+ 
+ #if defined(CHAMELEON_USE_CUBLAS_V2)
+ 
+-#include <cublas.h>
+ #include <cublas_v2.h>
+ 
+ #define CUBLAS_STREAM_PARAM cublasHandle_t handle
+--- a/runtime/starpu/include/chameleon_starpu.h.in
++++ b/runtime/starpu/include/chameleon_starpu.h.in
+@@ -60,11 +60,11 @@
+ #include <starpu_scheduler.h>
+ #include <starpu_cuda.h>
+ 
+-#include <cublas.h>
+ #include <starpu_cublas.h>
+ #if defined(CHAMELEON_USE_CUBLAS_V2)
+-#include <cublas_v2.h>
+ #include <starpu_cublas_v2.h>
++#else
++#include <cublas.h>
+ #endif
+ #endif
+ 

@@ -1,0 +1,119 @@
+--- a/runtime/starpu/codelets/codelet_zgemm.c
++++ b/runtime/starpu/codelets/codelet_zgemm.c
+@@ -78,6 +78,43 @@
+     dare_gemm_words = words;
+     fprintf(stderr, "DARE static DGEMM GPU owners: %d %d %d %d\n",
+             devices[0], devices[1], devices[2], devices[3]);
++}
++
++static pthread_once_t dare_solve_once = PTHREAD_ONCE_INIT;
++static unsigned dare_solve_policy;
++
++static void dare_solve_init_policy(void)
++{
++    const char *trsm = getenv("DARE_STATIC_TRSM");
++    const char *lu = getenv("DARE_STATIC_LU");
++    if (trsm != NULL && strcmp(trsm, "1") == 0) dare_solve_policy |= 1;
++    if (lu != NULL && strcmp(lu, "1") == 0) dare_solve_policy |= 2;
++    if (dare_solve_policy == 0) return;
++    pthread_once(&dare_gemm_once, dare_gemm_init_owners);
++    if (dare_gemm_words == 0) {
++        fprintf(stderr, "DARE_STATIC_TRSM/LU require DARE_STATIC_GEMM=1\n");
++        abort();
++    }
++    fprintf(stderr, "DARE static solve placement: TRSM=%u LU=%u\n",
++            !!(dare_solve_policy & 1), !!(dare_solve_policy & 2));
++}
++
++/* Reuse GEMM's actual worker masks, including both workers on each GPU.
++ * kind=1: TRSM output B, kind=2: cuSOLVER LU output A.
++ * The caller must honor any explicit worker selected by the application.
++ * All operations still use FP64 and the original task dependencies. */
++void dare_static_solve_owner(const CHAM_desc_t *desc, int m, int n,
++                             unsigned kind, unsigned *words, uint32_t **workers)
++{
++    *words = 0;
++    *workers = NULL;
++    pthread_once(&dare_solve_once, dare_solve_init_policy);
++    if ((dare_solve_policy & kind) == 0) return;
++    const int row = desc->i / desc->mb + m;
++    const int col = desc->j / desc->nb + n;
++    const int owner = 2 * (row % 2) + col % 2;
++    *words = dare_gemm_words;
++    *workers = dare_gemm_masks[owner];
+ }
+ #endif
+ 
+--- a/runtime/starpu/codelets/codelet_ztrsm.c
++++ b/runtime/starpu/codelets/codelet_ztrsm.c
+@@ -25,6 +25,11 @@
+  */
+ #include "chameleon_starpu.h"
+ #include "runtime_codelet_z.h"
++
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++extern void dare_static_solve_owner(const CHAM_desc_t *, int, int, unsigned,
++                                    unsigned *, uint32_t **);
++#endif
+ 
+ struct cl_ztrsm_args_s {
+     cham_side_t side;
+@@ -126,6 +131,14 @@
+     /* Fix the worker id */
+     workerid = (schedopt == NULL) ? -1 : schedopt->workerid;
+ 
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++    unsigned owner_words = 0;
++    uint32_t *owner_workers = NULL;
++    if (workerid < 0) {
++        dare_static_solve_owner(B, Bm, Bn, 1, &owner_words, &owner_workers);
++    }
++#endif
++
+     /* Insert the task */
+     rt_starpu_insert_task(
+         &cl_ztrsm,
+@@ -138,6 +151,9 @@
+         STARPU_PRIORITY,          options->priority,
+         STARPU_CALLBACK,          callback,
+         STARPU_EXECUTE_ON_WORKER, workerid,
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++        STARPU_TASK_WORKERIDS, owner_words, owner_workers,
++#endif
+ #if defined(CHAMELEON_CODELETS_HAVE_NAME)
+         STARPU_NAME,              cl_name,
+ #endif
+--- a/runtime/starpu/codelets/codelet_zgetrf_nopiv.c
++++ b/runtime/starpu/codelets/codelet_zgetrf_nopiv.c
+@@ -29,6 +29,9 @@
+ #if defined(CHAMELEON_DARE_CUSOLVER_LU) && defined(PRECISION_d)
+ #include <cusolverDn.h>
+ #include <pthread.h>
++
++extern void dare_static_solve_owner(const CHAM_desc_t *, int, int, unsigned,
++                                    unsigned *, uint32_t **);
+ 
+ struct dare_lu_device {
+     pthread_mutex_t lock;
+@@ -210,6 +213,11 @@
+         (workerid < 0 || starpu_worker_get_type(workerid) == STARPU_CUDA_WORKER)) {
+         codelet = &cl_dare_cusolver_lu;
+     }
++    unsigned owner_words = 0;
++    uint32_t *owner_workers = NULL;
++    if (workerid < 0 && codelet == &cl_dare_cusolver_lu) {
++        dare_static_solve_owner(A, Am, An, 2, &owner_words, &owner_workers);
++    }
+ #endif
+ 
+     CHAMELEON_BEGIN_ACCESS_DECLARATION;
+@@ -228,6 +236,9 @@
+         STARPU_PRIORITY,  options->priority,
+         STARPU_CALLBACK,  callback,
+         STARPU_EXECUTE_ON_WORKER, workerid,
++#if defined(CHAMELEON_DARE_CUSOLVER_LU) && defined(PRECISION_d)
++        STARPU_TASK_WORKERIDS, owner_words, owner_workers,
++#endif
+ #if defined(CHAMELEON_CODELETS_HAVE_NAME)
+         STARPU_NAME, codelet->name,
+ #endif

@@ -1,0 +1,211 @@
+--- a/runtime/starpu/CMakeLists.txt
++++ b/runtime/starpu/CMakeLists.txt
+@@ -275,6 +275,16 @@
+ if (NOT CHAMELEON_SIMULATION)
+   if (CHAMELEON_USE_CUDA)
+     target_link_libraries(chameleon_starpu PUBLIC CUDA::CUBLAS)
++    option(CHAMELEON_DARE_CUSOLVER_LU "Enable the optional FP64 cuSOLVER LU codelet" OFF)
++    if (CHAMELEON_DARE_CUSOLVER_LU)
++      find_library(DARE_CUSOLVER_LIBRARY NAMES cusolver
++        HINTS "${CUDA_TOOLKIT_ROOT_DIR}/lib64")
++      if (NOT DARE_CUSOLVER_LIBRARY)
++        message(FATAL_ERROR "cuSOLVER library not found")
++      endif()
++      target_link_libraries(chameleon_starpu PRIVATE "${DARE_CUSOLVER_LIBRARY}")
++      target_compile_definitions(chameleon_starpu PRIVATE CHAMELEON_DARE_CUSOLVER_LU)
++    endif()
+   endif()
+ endif()
+ 
+--- a/runtime/starpu/codelets/codelet_zgetrf_nopiv.c
++++ b/runtime/starpu/codelets/codelet_zgetrf_nopiv.c
+@@ -26,6 +26,141 @@
+ #include "chameleon_starpu.h"
+ #include "runtime_codelet_z.h"
+ 
++#if defined(CHAMELEON_DARE_CUSOLVER_LU) && defined(PRECISION_d)
++#include <cusolverDn.h>
++#include <pthread.h>
++
++struct dare_lu_device {
++    pthread_mutex_t lock;
++    cusolverDnHandle_t handle;
++    double *workspace;
++    int workspace_size;
++    int *info;
++    unsigned completed_tiles;
++};
++
++static struct dare_lu_device dare_lu_devices[STARPU_MAXNODES];
++static pthread_once_t dare_lu_once = PTHREAD_ONCE_INIT;
++
++
++static void dare_lu_init_locks(void)
++{
++    for (unsigned i = 0; i < STARPU_MAXNODES; ++i) {
++        pthread_mutex_init(&dare_lu_devices[i].lock, NULL);
++    }
++}
++
++static struct dare_lu_device *dare_lu_device(void)
++{
++    pthread_once(&dare_lu_once, dare_lu_init_locks);
++    return &dare_lu_devices[starpu_worker_get_local_memory_node()];
++}
++
++static void dare_cusolver_lu_cleanup(void *unused)
++{
++    (void)unused;
++    struct dare_lu_device *device = dare_lu_device();
++    pthread_mutex_lock(&device->lock);
++    if (device->handle != NULL) {
++        fprintf(stderr, "DARE cuSOLVER LU device %d completed tiles: %u\n",
++                starpu_worker_get_devid(starpu_worker_get_id()), device->completed_tiles);
++        device->completed_tiles = 0;
++        cudaFree(device->workspace);
++        cudaFree(device->info);
++        cusolverDnDestroy(device->handle);
++        device->workspace = NULL;
++        device->workspace_size = 0;
++        device->info = NULL;
++        device->handle = NULL;
++    }
++    pthread_mutex_unlock(&device->lock);
++}
++
++void dare_cusolver_lu_finalize(void)
++{
++    const char *use_cusolver = getenv("DARE_CUSOLVER_LU");
++    if (use_cusolver != NULL && strcmp(use_cusolver, "1") == 0) {
++        starpu_execute_on_each_worker(dare_cusolver_lu_cleanup, NULL, STARPU_CUDA);
++    }
++}
++
++static int dare_lu_factor(struct dare_lu_device *device, cudaStream_t stream,
++                          int m, int n, double *matrix, int ld, int *info)
++{
++    cusolverStatus_t solver_status = CUSOLVER_STATUS_SUCCESS;
++    cudaError_t cuda_status = cudaSuccess;
++    int workspace_size;
++
++    if (device->handle == NULL) {
++        solver_status = cusolverDnCreate(&device->handle);
++        if (solver_status != CUSOLVER_STATUS_SUCCESS) goto fail;
++    }
++    if (device->info == NULL) {
++        cuda_status = cudaMalloc((void **)&device->info, sizeof(*device->info));
++        if (cuda_status != cudaSuccess) goto fail;
++    }
++    solver_status = cusolverDnSetStream(device->handle, stream);
++    if (solver_status != CUSOLVER_STATUS_SUCCESS) goto fail;
++    solver_status = cusolverDnDgetrf_bufferSize(device->handle, m, n, matrix, ld,
++                                               &workspace_size);
++    if (solver_status != CUSOLVER_STATUS_SUCCESS) goto fail;
++
++    if (workspace_size > device->workspace_size) {
++        double *workspace = NULL;
++        cuda_status = cudaMalloc((void **)&workspace, (size_t)workspace_size * sizeof(*workspace));
++        if (cuda_status != cudaSuccess) goto fail;
++        cudaFree(device->workspace);
++        device->workspace = workspace;
++        device->workspace_size = workspace_size;
++    }
++
++    solver_status = cusolverDnDgetrf(device->handle, m, n, matrix, ld,
++                                    device->workspace, NULL, device->info);
++    if (solver_status != CUSOLVER_STATUS_SUCCESS) goto fail;
++    cuda_status = cudaMemcpyAsync(info, device->info, sizeof(*info),
++                                  cudaMemcpyDeviceToHost, stream);
++    if (cuda_status != cudaSuccess) goto fail;
++    cuda_status = cudaStreamSynchronize(stream);
++    if (cuda_status != cudaSuccess) goto fail;
++    return CHAMELEON_SUCCESS;
++
++fail:
++    cudaStreamSynchronize(stream);
++    fprintf(stderr, "DARE cuSOLVER LU failed (cuSOLVER status %d, CUDA status %d)\n",
++            (int)solver_status, (int)cuda_status);
++    return CHAMELEON_ERR_UNEXPECTED;
++}
++
++static void cl_dare_cusolver_lu_cuda_func(void *descr[], void *cl_arg)
++{
++    int m, n, ib, iinfo, info = 0;
++    RUNTIME_sequence_t *sequence;
++    RUNTIME_request_t *request;
++    CHAM_tile_t *tile = cti_interface_get(descr[0]);
++    struct dare_lu_device *device = dare_lu_device();
++
++    starpu_codelet_unpack_args(cl_arg, &m, &n, &ib, &iinfo, &sequence, &request);
++    cudaStream_t stream = starpu_cuda_get_local_stream();
++
++    /* Serialize getrf through completion per device across StarPU CUDA streams. */
++    pthread_mutex_lock(&device->lock);
++    int status = dare_lu_factor(device, stream, m, n, tile->mat, tile->ld, &info);
++    if (status == CHAMELEON_SUCCESS && info == 0) {
++        ++device->completed_tiles;
++    }
++    pthread_mutex_unlock(&device->lock);
++
++    if (status == CHAMELEON_SUCCESS && info != 0) {
++        status = info > 0 ? iinfo + info : CHAMELEON_ERR_ILLEGAL_VALUE;
++    }
++    if (status != CHAMELEON_SUCCESS && sequence->status == CHAMELEON_SUCCESS) {
++        RUNTIME_sequence_flush(NULL, sequence, request, status);
++    }
++}
++
++CODELETS_ALL(dare_cusolver_lu, NULL, cl_dare_cusolver_lu_cuda_func, STARPU_CUDA, 0)
++#endif
++
+ /*
+  * Codelet CPU
+  */
+@@ -67,6 +202,15 @@
+     void (*callback)(void*) = options->profiling ? cl_zgetrf_nopiv_callback : NULL;
+     starpu_option_request_t* schedopt = (starpu_option_request_t *)(options->request->schedopt);
+     int workerid = (schedopt == NULL) ? -1 : schedopt->workerid;
++
++#if defined(CHAMELEON_DARE_CUSOLVER_LU) && defined(PRECISION_d)
++    const char *use_cusolver = getenv("DARE_CUSOLVER_LU");
++    if (use_cusolver != NULL && strcmp(use_cusolver, "1") == 0 &&
++        starpu_cuda_worker_get_count() > 0 &&
++        (workerid < 0 || starpu_worker_get_type(workerid) == STARPU_CUDA_WORKER)) {
++        codelet = &cl_dare_cusolver_lu;
++    }
++#endif
+ 
+     CHAMELEON_BEGIN_ACCESS_DECLARATION;
+     CHAMELEON_ACCESS_RW(A, Am, An);
+@@ -85,7 +229,7 @@
+         STARPU_CALLBACK,  callback,
+         STARPU_EXECUTE_ON_WORKER, workerid,
+ #if defined(CHAMELEON_CODELETS_HAVE_NAME)
+-        STARPU_NAME, "zgetrf_nopiv",
++        STARPU_NAME, codelet->name,
+ #endif
+         0);
+ }
+--- a/runtime/starpu/control/runtime_control.c
++++ b/runtime/starpu/control/runtime_control.c
+@@ -150,12 +150,20 @@
+     return hres;
+ }
+ 
++#if defined(CHAMELEON_DARE_CUSOLVER_LU)
++extern void dare_cusolver_lu_finalize(void);
++#endif
++
+ /**
+  *
+  */
+ void RUNTIME_finalize( CHAM_context_t *chamctxt )
+ {
+     (void)chamctxt;
++
++#if defined(CHAMELEON_DARE_CUSOLVER_LU)
++    dare_cusolver_lu_finalize();
++#endif
+ 
+     /* StarPU was already initialized by an external library */
+     if ( chamctxt->schedopt == NULL ) {

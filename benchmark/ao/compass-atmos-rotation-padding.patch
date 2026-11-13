@@ -1,0 +1,14 @@
+--- a/shesha/init/atmos_init.py
++++ b/shesha/init/atmos_init.py
+@@ -103,6 +103,11 @@
+     # Meta-pupil diameter for all layers depending on altitude
+     patch_diam = (p_geom._n + 2 * (max_size * CONST.ARCSEC2RAD * p_atmos.alt) /
+                   p_atmos.pupixsize + 4).astype(np.int64)
++    # Rotated WFS pupils sample a larger bounding box than the on-axis pupil.
++    if p_wfss and any(wfs.thetaML for wfs in p_wfss):
++        rotation_extent = max(abs(np.cos(wfs.thetaML)) + abs(np.sin(wfs.thetaML))
++                              for wfs in p_wfss)
++        patch_diam += int(np.ceil((rotation_extent - 1) * p_geom._n)) + 4
+     p_atmos.dim_screens = (patch_diam + patch_diam % 2)
+ 
+     # Phase screen speeds

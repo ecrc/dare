@@ -87,7 +87,7 @@ void fits_set_hdu(fitsfile *fits_file_ptr, const std::string &hdu_name){
 
 std::string fits_file_name(fitsfile *fits_file_ptr){
   int status=0;
-  char file_name[FITS_MAX_CHAR];
+  char file_name[FLEN_FILENAME];
   if(fits_file_name(fits_file_ptr, file_name, &status)){
     fits_report_error(stderr,status);
     throw std::runtime_error("Error reading fits file name");

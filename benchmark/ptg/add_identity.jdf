@@ -1,0 +1,22 @@
+extern "C" %{
+#include "parsec/data_dist/matrix/matrix.h"
+%}
+
+S [type = "parsec_tiled_matrix_t *"]
+NT [type = int hidden = true default = "S->mt"]
+NB [type = int hidden = true default = "S->mb"]
+
+ADD_IDENTITY(k)
+  k = 0 .. NT-1
+: S(k, k)
+
+  RW tile <- S(k, k)
+          -> S(k, k)
+
+BODY
+  const int remaining = S->m - k * NB;
+  const int rows = remaining < NB ? remaining : NB;
+  double *block = tile;
+  for (int i = 0; i < rows; ++i)
+      block[i + (size_t)i * NB] += 1.0;
+END

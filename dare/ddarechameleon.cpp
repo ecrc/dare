@@ -17,6 +17,11 @@
 #include "chameleonsrc/testings.h"
 
 #include "chameleonsrc/chameio.hpp"
+#include "chameleonsrc/tile_input.hpp"
+#include "chameleonsrc/tile_output.hpp"
+#include "chameleonsrc/linear_snapshot.hpp"
+#include "chameleonsrc/convergence_norm.hpp"
+#include "chameleonsrc/form_system.hpp"
 
 using std::to_string;
 
@@ -76,6 +81,7 @@ static void show_help(char *prog_name) {
             "  --ninstr=X       Instrument dimension. measurements (default: 500)\n"
             "  --nb=X           tile size.            (default: 128)\n"
             "\n"
+            "  --tilepath=X     directory with packed FP64 inputs (single MPI rank)\n"
             "  --datapath=X     path to the data folder"
             "                   this folder must contain the following files:"
             "                       At.fits"
@@ -98,7 +104,7 @@ static void show_help(char *prog_name) {
 /**
  * Read arguments following step1 program call
  */
-static void read_args(int argc, char *argv[], int *iparam, std::string &datapath){
+static void read_args(int argc, char *argv[], int *iparam, std::string &datapath, std::string &tilepath){
     int i;
     for (i = 1; i < argc && argv[i]; ++i) {
         if ( startswith( argv[i], "--help") || startswith( argv[i], "-help") ||
@@ -117,6 +123,8 @@ static void read_args(int argc, char *argv[], int *iparam, std::string &datapath
             sscanf( strchr( argv[i], '=' ) + 1, "%d", &(iparam[IPARAM_THRDNBR]) );
         } else if (startswith( argv[i], "--gpus=" )) {
             sscanf( strchr( argv[i], '=' ) + 1, "%d", &(iparam[IPARAM_NGPUS]) );
+        } else if (startswith( argv[i], "--tilepath=" )) {
+            tilepath = argv[i] + 11;
         } else if (startswith( argv[i], "--datapath=" )) {
             datapath = std::string(argv[i]);
             datapath.erase(0, 11); //remove '--datapath='
@@ -269,7 +277,13 @@ int main(int argc, char *argv[]) {
 
     /* read arguments */
     std::string datapath="";
-    read_args(argc, argv, iparam, datapath);
+    std::string tilepath;
+    read_args(argc, argv, iparam, datapath, tilepath);
+    const char *tile_output_dir = getenv("DARE_TILE_OUTPUT_DIR");
+    if (!tilepath.empty() && (!datapath.empty() || iparam[IPARAM_CHECK])) {
+        fprintf(stderr, "--tilepath requires using a single input mode and omitting --check\n");
+        return EXIT_FAILURE;
+    }
     N      = iparam[IPARAM_N];
     NINSTR = iparam[IPARAM_NINSTR];
     NB     = iparam[IPARAM_NB];
@@ -301,11 +315,31 @@ int main(int argc, char *argv[]) {
     int nooptalgo = iparam[IPARAM_NOOPTALGO];
     int profile = iparam[IPARAM_PROFILE];
 
-    /* print informations to user */
-    print_header( argv[0], iparam, datapath);
-
     /* Initialize CHAMELEON with main parameters */
-    CHAMELEON_Init( NCPUS, NGPUS );
+    const int init_status = CHAMELEON_Init(NCPUS, NGPUS);
+    if (init_status != CHAMELEON_SUCCESS) {
+        return EXIT_FAILURE;
+    }
+    const int rank = CHAMELEON_Comm_rank();
+    const int ranks = CHAMELEON_Comm_size();
+    const char *async_norm_option = getenv("DARE_ASYNC_NORM");
+    const bool async_norm = async_norm_option && strcmp(async_norm_option, "1") == 0;
+    if (async_norm && (ranks != 1 || check)) {
+        fprintf(stderr, "DARE_ASYNC_NORM requires one MPI rank and omitting --check\n");
+        CHAMELEON_Finalize();
+        return EXIT_FAILURE;
+    }
+    if ((!tilepath.empty() || tile_output_dir != nullptr) && ranks != 1) {
+        fprintf(stderr, "Packed tile I/O requires one MPI rank\n");
+        CHAMELEON_Finalize();
+        return EXIT_FAILURE;
+    }
+    for (P = static_cast<int>(sqrt(ranks)); ranks % P != 0; --P) {}
+    Q = ranks / P;
+    if (rank == 0) {
+        print_header(argv[0], iparam, datapath);
+        printf("\n");
+    }
     CHAMELEON_Set( CHAMELEON_TILE_SIZE, NB );
     CHAMELEON_Set( CHAMELEON_INNER_BLOCK_SIZE, IB );
     CHAMELEON_Set( CHAMELEON_HOUSEHOLDER_MODE, ChamFlatHouseholder );
@@ -324,16 +358,22 @@ int main(int argc, char *argv[]) {
 
 
     /* Creates the matrices */
-    CHAMELEON_Desc_Create(
-        &descA, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, N, N, 0, 0, N, N, P, Q );
-    CHAMELEON_Desc_Create(
-        &descB, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, N, NINSTR, 0, 0, N, NINSTR, P, Q );
-    CHAMELEON_Desc_Create(
-        &descBinit, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, N, NINSTR, 0, 0, N, NINSTR, P, Q );
-    CHAMELEON_Desc_Create(
-        &descQ, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, N, N, 0, 0, N, N, P, Q );
-    CHAMELEON_Desc_Create(
-        &descR, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, NINSTR, NINSTR, 0, 0, NINSTR, NINSTR, P, Q ); // descR needs to be inverted then square rooted
+    const char *pinned = getenv("DARE_TILE_PINNED_INPUT");
+    const bool pinned_input = !tilepath.empty() && pinned != nullptr && strcmp(pinned, "1") == 0;
+    void *input_storage = pinned_input ? CHAMELEON_MAT_ALLOC_GLOBAL : (void*)(-mtxfmt);
+    const auto create_input = [&](CHAM_desc_t **desc, int rows, int cols) {
+        return CHAMELEON_Desc_Create(desc, input_storage, ChamRealDouble, NB, NB, NB * NB,
+                                    rows, cols, 0, 0, rows, cols, P, Q);
+    };
+    if (create_input(&descA, N, N) != CHAMELEON_SUCCESS ||
+        create_input(&descB, N, NINSTR) != CHAMELEON_SUCCESS ||
+        create_input(&descBinit, N, NINSTR) != CHAMELEON_SUCCESS ||
+        create_input(&descQ, N, N) != CHAMELEON_SUCCESS ||
+        create_input(&descR, NINSTR, NINSTR) != CHAMELEON_SUCCESS) {
+        fprintf(stderr, "Could not allocate DARE input descriptors\n");
+        CHAMELEON_Finalize();
+        return EXIT_FAILURE;
+    }
     CHAMELEON_Desc_Create(
         &descK, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, NINSTR, N, 0, 0, NINSTR, N, P, Q );
     CHAMELEON_Desc_Create(
@@ -361,17 +401,37 @@ int main(int argc, char *argv[]) {
     CHAMELEON_Desc_Create(
         &descbuf5, (void*)(-mtxfmt), ChamRealDouble, NB, NB, NB * NB, N, N, 0, 0, N, N, P, Q );
 
+    int local_tiles = 0;
+    for (int row = 0; row < descA->mt; ++row) {
+        for (int col = 0; col < descA->nt; ++col) {
+            local_tiles += descA->get_rankof(descA, row, col) == rank;
+        }
+    }
+    printf("DARE MPI rank %d/%d grid %dx%d A tiles %d/%d\n",
+           rank, ranks, P, Q, local_tiles, descA->mt * descA->nt);
+
     CHAMELEON_Alloc_Workspace_dgels( N, N, &descT1, P, Q );
     CHAMELEON_Alloc_Workspace_dgels( NINSTR, NINSTR, &descT2, P, Q );
 
 
+    const bool direct_beta = dare_system_optimization_enabled("DARE_DIRECT_BETA");
+    const bool diagonal_identity = dare_system_optimization_enabled("DARE_DIAGONAL_IDENTITY");
+    CHAM_desc_t *const beta_product = direct_beta ? descbetaold : descbeta;
+    const DareSystemIdentity system_identity(descId, desccommon, diagonal_identity);
+
+    const char *split_update_option = getenv("DARE_SPLIT_UPDATE_WORK");
+    const bool split_update_work = !check && split_update_option &&
+                                   strcmp(split_update_option, "1") == 0;
+    // The diagnostic workspace is otherwise idle and separates the beta and alpha updates.
+    CHAM_desc_t *const &beta_work = split_update_work ? descbuf5 : descbuf1;
+
     void *ws1, *ws2, *ws3, *ws4, *ws5, *ws6, *ws7, *ws8, *ws9, *ws10, *ws11, *ws12, *ws13, *ws14, *ws15;
     ws1 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamTrans, descB, descB, descbetaold );
-    ws2 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descbeta, descgamma, desccommon );
+    ws2 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, beta_product, descgamma, desccommon );
     ws3 = CHAMELEON_dgemm_WS_Alloc( ChamTrans, ChamNoTrans, descalphaold, descgamma, descbuf1 );
     ws4 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descbuf1, descalpha, descgamma );
-    ws5 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamTrans, descbeta, descalphaold, descbuf1 );
-    ws6 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descalphaold, descbuf1, descbetaold );
+    ws5 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamTrans, descbeta, descalphaold, beta_work );
+    ws6 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descalphaold, beta_work, descbetaold );
     ws7 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descalphaold, descalpha, descbuf1 );
     ws8 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descBinit, descgamma, descbuf2 );
     ws9 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descbuf2, descBinit, descR );
@@ -383,7 +443,18 @@ int main(int argc, char *argv[]) {
     ws15 = CHAMELEON_dgemm_WS_Alloc( ChamNoTrans, ChamNoTrans, descbuf5, descA, descQ );
 
 
-    if(datapath != ""){
+    double input_seconds;
+    START_TIMING(input_seconds);
+    if (!tilepath.empty()) {
+        try {
+            dare_tiles::read_inputs(tilepath, N, {descA, descB, descBinit, descQ, descR});
+        } catch (const std::exception &error) {
+            fprintf(stderr, "%s\n", error.what());
+            CHAMELEON_Finalize();
+            return EXIT_FAILURE;
+        }
+        printf("Packed tile input: %s\n", tilepath.c_str());
+    } else if(datapath != ""){
     /* Fills the matrix with files content */
         read_desc<double>(file_At, descA);
         read_desc<double>(file_BinvRt, descB);
@@ -400,6 +471,9 @@ int main(int argc, char *argv[]) {
     }
 
 
+    STOP_TIMING(input_seconds);
+    printf("Input seconds: %.3f\n", input_seconds);
+
     /* Start kernel statistics */
     if ( profile ) {
         CHAMELEON_Enable( CHAMELEON_KERNELPROFILE_MODE );
@@ -412,6 +486,11 @@ int main(int argc, char *argv[]) {
 
 
     /* Calculates the DARE solution */
+    std::unique_ptr<DareConvergenceNorm> convergence_norm;
+    if (async_norm) {
+        convergence_norm = std::make_unique<DareConvergenceNorm>(descbuf1);
+        printf("DARE async convergence norm enabled\n");
+    }
     START_TIMING( time );
     printf("\n");
     CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamTrans,
@@ -425,7 +504,7 @@ int main(int argc, char *argv[]) {
     if (sync) CHAMELEON_Sequence_Wait( sequence );
     CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descQ, descgamma, sequence, &request );
     if (sync) CHAMELEON_Sequence_Wait( sequence );
-    CHAMELEON_dlaset_Tile_Async( ChamUpperLower, 0.0, 1.0, descId, sequence, &request );
+    system_identity.initialize(sequence, &request);
     if (sync) CHAMELEON_Sequence_Wait( sequence );
 
     /* Create the task flag */
@@ -439,15 +518,18 @@ int main(int argc, char *argv[]) {
         //RUNTIME_barrier( chamctxt );
         //RUNTIME_options_init_color(&options, chamctxt);
 
-        CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descbetaold, descbeta, sequence, &request );
-        if (sync) CHAMELEON_Sequence_Wait( sequence );
+        if (!direct_beta) {
+            CHAMELEON_dlacpy_Tile_Async(ChamUpperLower, descbetaold, descbeta, sequence, &request);
+            if (sync) CHAMELEON_Sequence_Wait(sequence);
+        }
         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamNoTrans,
-                          1.0, descbeta, descgamma,
+                          1.0, beta_product, descgamma,
                           0.0, desccommon, ws2, sequence, &request );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
         flops = flops + flops_dgemm( N, N, N );
-        CHAMELEON_dgeadd_Tile_Async( ChamNoTrans, 1.0, descId, 1.0, desccommon, sequence, &request );
+        system_identity.add(sequence, &request);
         if (sync) CHAMELEON_Sequence_Wait( sequence );
+        dare_linear_snapshot(it, desccommon, descalpha, beta_product, sequence);
         CHAMELEON_dlacpy_Tile_Async( ChamUpperLower, descalpha, descalphaold, sequence, &request );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
 
@@ -475,12 +557,19 @@ int main(int argc, char *argv[]) {
                  if (sync) CHAMELEON_Sequence_Wait( sequence );
                  flops = flops + flops_dgetrf( N, N ) + flops_dgetrs( N, N );
 
+        if (direct_beta) {
+            // The copy is only needed by the beta solve. It can run alongside LU.
+            CHAMELEON_dlacpy_Tile_Async(ChamUpperLower, descbetaold, descbeta, sequence, &request);
+            if (sync) CHAMELEON_Sequence_Wait(sequence);
+        }
+
         //RUNTIME_options_init_color(&options, chamctxt);
         CHAMELEON_dgemm_Tile_Async( ChamTrans, ChamNoTrans,
                           1.0, descalphaold, descgamma,
                           0.0, descbuf1, ws3, sequence, &request );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
         flops = flops + flops_dgemm( N, N, N );
+        if (convergence_norm) convergence_norm->submit(sequence, &request);
 
         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamNoTrans,
                           1.0, descbuf1, descalpha,
@@ -556,7 +645,8 @@ int main(int argc, char *argv[]) {
         }
 
 	//CHAMELEON_dlange_Tile_Async( ChamFrobeniusNorm, descbuf1, &norm, sequence, &request );
-	norm = CHAMELEON_dlange_Tile( ChamFrobeniusNorm, descbuf1 );
+	norm = convergence_norm ? convergence_norm->get()
+                                : CHAMELEON_dlange_Tile( ChamFrobeniusNorm, descbuf1 );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
         //CHAMELEON_Desc_Flush( descbuf1, sequence );
 
@@ -605,13 +695,13 @@ int main(int argc, char *argv[]) {
 
         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamTrans,
                           1.0, descbeta, descalphaold,
-                          0.0, descbuf1, ws5, sequence, &request );
+                          0.0, beta_work, ws5, sequence, &request );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
         flops = flops + flops_dgemm( N, N, N );
 
         //RUNTIME_options_init_color(&options, chamctxt);
         CHAMELEON_dgemm_Tile_Async( ChamNoTrans, ChamNoTrans,
-                          1.0, descalphaold, descbuf1,
+                          1.0, descalphaold, beta_work,
                           1.0, descbetaold, ws6, sequence, &request );
         if (sync) CHAMELEON_Sequence_Wait( sequence );
         flops = flops + flops_dgemm( N, N, N );
@@ -670,8 +760,21 @@ int main(int argc, char *argv[]) {
     flops = flops + flops_dgemm( NINSTR, N, N );
 
     STOP_TIMING( time );
+    hres = sequence->status;
 
-//    write_desc<double>(std::string(datapath + "/descK"+to_string(N)+"-double-lunopiv.fits"),descK);
+    bool output_failed = false;
+    if (tile_output_dir != nullptr && hres == CHAMELEON_SUCCESS) {
+        try {
+            double output_seconds;
+            START_TIMING(output_seconds);
+            dare_tiles::write_outputs(tile_output_dir, descK, descgamma);
+            STOP_TIMING(output_seconds);
+            printf("Packed tile output seconds: %.6f\n", output_seconds);
+        } catch (const std::exception &error) {
+            fprintf(stderr, "%s\n", error.what());
+            output_failed = true;
+        }
+    }
 
     /* Stop tracing */
     if ( trace ) {
@@ -716,6 +819,7 @@ int main(int argc, char *argv[]) {
 
     //CHAMELEON_Desc_Flush( descA, sequence );
 
+    convergence_norm.reset();
     CHAMELEON_Sequence_Destroy( sequence );
 
     CHAMELEON_dgemm_WS_Free( ws1 );
@@ -759,5 +863,5 @@ int main(int argc, char *argv[]) {
     /* Finalize CHAMELEON */
     CHAMELEON_Finalize();
 
-    return EXIT_SUCCESS;
+    return hres == CHAMELEON_SUCCESS && !output_failed ? EXIT_SUCCESS : EXIT_FAILURE;
 }

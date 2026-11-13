@@ -1,0 +1,30 @@
+--- a/dare/ddarechameleon.cpp
++++ b/dare/ddarechameleon.cpp
+@@ -260,7 +260,6 @@
+ 
+     /* variable to check the numerical results */
+     double anorm, bnorm, xnorm, eps, res;
+-    int hres = 0; // return code for chameleon functions
+ 
+     /* initialize some parameters with default values */
+     int iparam[IPARAM_SIZEOF];
+@@ -670,6 +669,10 @@
+     flops = flops + flops_dgemm( NINSTR, N, N );
+ 
+     STOP_TIMING( time );
++    const int hres = sequence->status;
++    if (hres != CHAMELEON_SUCCESS) {
++        fprintf(stderr, "Chameleon sequence failed with status %d\n", hres);
++    }
+ 
+ //    write_desc<double>(std::string(datapath + "/descK"+to_string(N)+"-double-lunopiv.fits"),descK);
+ 
+@@ -759,5 +762,5 @@
+     /* Finalize CHAMELEON */
+     CHAMELEON_Finalize();
+ 
+-    return EXIT_SUCCESS;
+-}
+\ No newline at end of file
++    return hres == CHAMELEON_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
++}

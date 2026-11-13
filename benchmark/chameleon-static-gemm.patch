@@ -1,0 +1,96 @@
+--- a/runtime/starpu/codelets/codelet_zgemm.c
++++ b/runtime/starpu/codelets/codelet_zgemm.c
+@@ -25,6 +25,61 @@
+  */
+ #include "chameleon_starpu.h"
+ #include "runtime_codelet_z.h"
++
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define DARE_GPU_COUNT 4
++#define DARE_MASK_WORDS ((STARPU_NMAXWORKERS + 31) / 32)
++
++static pthread_once_t dare_gemm_once = PTHREAD_ONCE_INIT;
++static uint32_t dare_gemm_masks[DARE_GPU_COUNT][DARE_MASK_WORDS];
++static unsigned dare_gemm_words;
++
++static void dare_gemm_init_owners(void)
++{
++    const char *enabled = getenv("DARE_STATIC_GEMM");
++    if (enabled == NULL || strcmp(enabled, "1") != 0) {
++        return;
++    }
++
++    int workers[STARPU_NMAXWORKERS];
++    int devices[DARE_GPU_COUNT];
++    unsigned count = starpu_worker_get_ids_by_type(STARPU_CUDA_WORKER, workers,
++                                                   STARPU_NMAXWORKERS);
++    unsigned ngpus = 0;
++    unsigned i;
++    unsigned words = 0;
++    for (i = 0; i < count; ++i) {
++        unsigned worker = (unsigned)workers[i];
++        int device = starpu_worker_get_devid(worker);
++        unsigned group = 0;
++        while (group < ngpus && devices[group] != device) {
++            ++group;
++        }
++        if (group == ngpus) {
++            if (ngpus == DARE_GPU_COUNT) {
++                break;
++            }
++            devices[ngpus++] = device;
++        }
++        unsigned word = worker / 32;
++        dare_gemm_masks[group][word] |= UINT32_C(1) << (worker % 32);
++        if (words <= word) {
++            words = word + 1;
++        }
++    }
++    if (count == 0 || ngpus != DARE_GPU_COUNT || i != count) {
++        fprintf(stderr, "DARE_STATIC_GEMM requires exactly four CUDA devices\n");
++        abort();
++    }
++    dare_gemm_words = words;
++    fprintf(stderr, "DARE static DGEMM GPU owners: %d %d %d %d\n",
++            devices[0], devices[1], devices[2], devices[3]);
++}
++#endif
+ 
+ struct cl_zgemm_args_s {
+     cham_trans_t transA;
+@@ -143,6 +198,21 @@
+     /* Fix the worker id */
+     workerid = (schedopt == NULL) ? -1 : schedopt->workerid;
+ 
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++    unsigned owner_words = 0;
++    uint32_t *owner_workers = NULL;
++    if (workerid < 0) {
++        pthread_once(&dare_gemm_once, dare_gemm_init_owners);
++        if (dare_gemm_words != 0) {
++            int row = C->i / C->mb + Cm;
++            int col = C->j / C->nb + Cn;
++            int owner = 2 * (row % 2) + col % 2;
++            owner_words = dare_gemm_words;
++            owner_workers = dare_gemm_masks[owner];
++        }
++    }
++#endif
++
+     /* Reduce the C access if needed */
+     accessC = ( beta == 0. ) ? STARPU_W : STARPU_RW;
+ 
+@@ -159,6 +229,9 @@
+         STARPU_PRIORITY,          options->priority,
+         STARPU_CALLBACK,          callback,
+         STARPU_EXECUTE_ON_WORKER, workerid,
++#if defined(PRECISION_d) && defined(CHAMELEON_USE_CUDA)
++        STARPU_TASK_WORKERIDS, owner_words, owner_workers,
++#endif
+ #if defined(CHAMELEON_CODELETS_HAVE_NAME)
+         STARPU_NAME,              cl_name,
+ #endif

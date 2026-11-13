@@ -1,0 +1,226 @@
+--- a/runtime/starpu/CMakeLists.txt
++++ b/runtime/starpu/CMakeLists.txt
+@@ -275,6 +275,13 @@
+ if (NOT CHAMELEON_SIMULATION)
+   if (CHAMELEON_USE_CUDA)
+     target_link_libraries(chameleon_starpu PUBLIC CUDA::CUBLAS)
++    option(CHAMELEON_DARE_GPU_NORM "Enable the optional FP64 CUDA Frobenius tile norm" OFF)
++    if (CHAMELEON_DARE_GPU_NORM)
++      enable_language(CUDA)
++      target_sources(chameleon_starpu PRIVATE codelets/dare_gpu_norm.cu)
++      target_compile_definitions(chameleon_starpu PRIVATE CHAMELEON_DARE_GPU_NORM)
++      set_property(TARGET chameleon_starpu PROPERTY CUDA_STANDARD 17)
++    endif()
+     option(CHAMELEON_DARE_CUSOLVER_LU "Enable the optional FP64 cuSOLVER LU codelet" OFF)
+     if (CHAMELEON_DARE_CUSOLVER_LU)
+       find_library(DARE_CUSOLVER_LIBRARY NAMES cusolver
+--- a/runtime/starpu/codelets/codelet_zgessq.c
++++ b/runtime/starpu/codelets/codelet_zgessq.c
+@@ -25,6 +25,54 @@
+ #include "chameleon_starpu.h"
+ #include "runtime_codelet_z.h"
+ 
++#if defined(CHAMELEON_DARE_GPU_NORM) && defined(PRECISION_d)
++extern size_t dare_gpu_norm_scratch_size(void);
++extern cudaError_t dare_gpu_tile_sumsq(int m, int n, const double *a, int ld,
++                                       double *pair, void *scratch, cudaStream_t stream);
++
++static void *dare_gpu_norm_scratch[STARPU_NMAXWORKERS];
++
++void dare_gpu_norm_cleanup(void *unused)
++{
++    (void)unused;
++    void **scratch = &dare_gpu_norm_scratch[starpu_worker_get_id()];
++    if (*scratch != NULL) {
++        cudaFree(*scratch);
++        *scratch = NULL;
++    }
++}
++
++static void cl_dare_gpu_norm_cuda_func(void *descr[], void *cl_arg)
++{
++    cham_store_t storev;
++    int m, n;
++    RUNTIME_sequence_t *sequence;
++    RUNTIME_request_t *request;
++    CHAM_tile_t *tileA = cti_interface_get(descr[0]);
++    CHAM_tile_t *tileW = cti_interface_get(descr[1]);
++
++    starpu_codelet_unpack_args(cl_arg, &storev, &m, &n, &sequence, &request);
++    // A worker enqueues all of its tile reductions on the same CUDA stream.
++    void **scratch = &dare_gpu_norm_scratch[starpu_worker_get_id()];
++    cudaError_t status = cudaSuccess;
++    if (*scratch == NULL) {
++        status = cudaMalloc(scratch, dare_gpu_norm_scratch_size());
++    }
++    if (status == cudaSuccess) {
++        status = dare_gpu_tile_sumsq(m, n, tileA->mat, tileA->ld, tileW->mat,
++                                     *scratch, starpu_cuda_get_local_stream());
++    }
++    if (status != cudaSuccess) {
++        fprintf(stderr, "DARE CUDA tile norm failed: %s\n", cudaGetErrorString(status));
++        if (sequence->status == CHAMELEON_SUCCESS) {
++            RUNTIME_sequence_flush(NULL, sequence, request, CHAMELEON_ERR_UNEXPECTED);
++        }
++    }
++}
++
++CODELETS_ALL(dare_gpu_norm, NULL, cl_dare_gpu_norm_cuda_func, STARPU_CUDA, STARPU_CUDA_ASYNC)
++#endif
++
+ #if !defined(CHAMELEON_SIMULATION)
+ static void cl_zgessq_cpu_func(void *descr[], void *cl_arg)
+ {
+@@ -37,7 +85,13 @@
+     tileA = cti_interface_get(descr[0]);
+     tileW = cti_interface_get(descr[1]);
+ 
++#if defined(CHAMELEON_DARE_GPU_NORM) && defined(PRECISION_d)
++    RUNTIME_sequence_t *sequence;
++    RUNTIME_request_t *request;
++    starpu_codelet_unpack_args(cl_arg, &storev, &m, &n, &sequence, &request);
++#else
+     starpu_codelet_unpack_args( cl_arg, &storev, &m, &n );
++#endif
+     TCORE_zgessq( storev, m, n, tileA, tileW );
+ }
+ #endif /* !defined(CHAMELEON_SIMULATION) */
+@@ -57,6 +111,15 @@
+     starpu_option_request_t* schedopt = (starpu_option_request_t *)(options->request->schedopt);
+     int workerid = (schedopt == NULL) ? -1 : schedopt->workerid;
+ 
++#if defined(CHAMELEON_DARE_GPU_NORM) && defined(PRECISION_d)
++    const char *gpu_norm = getenv("DARE_GPU_NORM");
++    if (storev == ChamEltwise && gpu_norm != NULL && strcmp(gpu_norm, "1") == 0 &&
++        starpu_cuda_worker_get_count() > 0 &&
++        (workerid < 0 || starpu_worker_get_type(workerid) == STARPU_CUDA_WORKER)) {
++        codelet = &cl_dare_gpu_norm;
++    }
++#endif
++
+     CHAMELEON_BEGIN_ACCESS_DECLARATION;
+     CHAMELEON_ACCESS_R(A, Am, An);
+     CHAMELEON_ACCESS_RW(SCALESUMSQ, SCALESUMSQm, SCALESUMSQn);
+@@ -67,13 +130,17 @@
+         STARPU_VALUE,    &storev,                     sizeof(cham_store_t),
+         STARPU_VALUE,    &m,                          sizeof(int),
+         STARPU_VALUE,    &n,                          sizeof(int),
++#if defined(CHAMELEON_DARE_GPU_NORM) && defined(PRECISION_d)
++        STARPU_VALUE,    &(options->sequence),        sizeof(RUNTIME_sequence_t*),
++        STARPU_VALUE,    &(options->request),         sizeof(RUNTIME_request_t*),
++#endif
+         STARPU_R,        RTBLKADDR(A, CHAMELEON_Complex64_t, Am, An),
+         STARPU_RW,       RTBLKADDR(SCALESUMSQ, double, SCALESUMSQm, SCALESUMSQn),
+         STARPU_PRIORITY, options->priority,
+         STARPU_CALLBACK, callback,
+         STARPU_EXECUTE_ON_WORKER, workerid,
+ #if defined(CHAMELEON_CODELETS_HAVE_NAME)
+-        STARPU_NAME, "zgessq",
++        STARPU_NAME, codelet->name,
+ #endif
+         0);
+ }
+--- /dev/null
++++ b/runtime/starpu/codelets/dare_gpu_norm.cu
+@@ -0,0 +1,79 @@
++#include <cub/block/block_reduce.cuh>
++#include <cuda_runtime.h>
++
++namespace {
++
++constexpr int threads = 128;
++constexpr int blocks = 32;
++
++struct ScaledSum {
++    double scale;
++    double squares;
++};
++
++// A pair represents scale^2 * squares without forming scale^2.
++struct MergeScaledSum {
++    __device__ ScaledSum operator()(ScaledSum a, ScaledSum b) const
++    {
++        if (isnan(a.scale)) return a;
++        if (isnan(b.scale)) return b;
++        if (a.scale == b.scale) return {a.scale, a.squares + b.squares};
++        if (a.scale < b.scale) {
++            const double ratio = a.scale / b.scale;
++            return {b.scale, fma(a.squares, ratio * ratio, b.squares)};
++        }
++        const double ratio = b.scale / a.scale;
++        return {a.scale, fma(b.squares, ratio * ratio, a.squares)};
++    }
++};
++
++using BlockReduce = cub::BlockReduce<ScaledSum, threads>;
++
++__global__ void tile_partials(int m, size_t count, const double *a, int ld,
++                              ScaledSum *partials)
++{
++    __shared__ BlockReduce::TempStorage reduction;
++    ScaledSum sum{0.0, 0.0};
++    const size_t stride = gridDim.x * blockDim.x;
++    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += stride) {
++        const size_t offset = ld == m ? i : (i / m) * ld + i % m;
++        const double magnitude = fabs(a[offset]);
++        sum = MergeScaledSum{}(sum, {magnitude, 1.0});
++    }
++    sum = BlockReduce(reduction).Reduce(sum, MergeScaledSum{});
++    if (threadIdx.x == 0) partials[blockIdx.x] = sum;
++}
++
++__global__ void finish_tile(const ScaledSum *partials, double *pair)
++{
++    __shared__ BlockReduce::TempStorage reduction;
++    ScaledSum sum = threadIdx.x < blocks ? partials[threadIdx.x] : ScaledSum{0.0, 0.0};
++    sum = BlockReduce(reduction).Reduce(sum, MergeScaledSum{});
++    if (threadIdx.x == 0) {
++        sum = MergeScaledSum{}({pair[0], pair[1]}, sum);
++        // Keep a nonfinite tile visible to the existing CPU reduction.
++        if (isnan(sum.scale)) sum = {1.0, sum.scale};
++        pair[0] = sum.scale;
++        pair[1] = sum.squares;
++    }
++}
++
++} // namespace
++
++extern "C" size_t dare_gpu_norm_scratch_size(void)
++{
++    return blocks * sizeof(ScaledSum);
++}
++
++extern "C" cudaError_t dare_gpu_tile_sumsq(int m, int n, const double *a, int ld,
++                                          double *pair, void *scratch, cudaStream_t stream)
++{
++    if (m == 0 || n == 0) return cudaSuccess;
++
++    auto *partials = static_cast<ScaledSum *>(scratch);
++    tile_partials<<<blocks, threads, 0, stream>>>(m, static_cast<size_t>(m) * n, a, ld, partials);
++    const cudaError_t status = cudaGetLastError();
++    if (status != cudaSuccess) return status;
++    finish_tile<<<1, threads, 0, stream>>>(partials, pair);
++    return cudaGetLastError();
++}
+--- a/runtime/starpu/control/runtime_control.c
++++ b/runtime/starpu/control/runtime_control.c
+@@ -153,6 +153,9 @@
+ #if defined(CHAMELEON_DARE_CUSOLVER_LU)
+ extern void dare_cusolver_lu_finalize(void);
+ #endif
++#if defined(CHAMELEON_DARE_GPU_NORM)
++extern void dare_gpu_norm_cleanup(void *);
++#endif
+ 
+ /**
+  *
+@@ -163,6 +166,9 @@
+ 
+ #if defined(CHAMELEON_DARE_CUSOLVER_LU)
+     dare_cusolver_lu_finalize();
++#endif
++#if defined(CHAMELEON_DARE_GPU_NORM)
++    starpu_execute_on_each_worker(dare_gpu_norm_cleanup, NULL, STARPU_CUDA);
+ #endif
+ 
+     /* StarPU was already initialized by an external library */
